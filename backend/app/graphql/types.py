@@ -71,6 +71,7 @@ class PolicyEvaluationType:
     score: float
     reason: str
     citations: list[PolicyCitationType]
+    model_provider: Optional[str]
     evaluated_at: datetime
 
     @classmethod
@@ -93,6 +94,7 @@ class PolicyEvaluationType:
             score=model.score,
             reason=model.reason,
             citations=citations,
+            model_provider=getattr(model, "model_provider", "deterministic-rule-engine") or "deterministic-rule-engine",
             evaluated_at=model.evaluated_at,
         )
 

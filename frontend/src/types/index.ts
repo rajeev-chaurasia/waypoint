@@ -67,6 +67,7 @@ export interface PolicyEvaluation {
   score: number;
   reason: string;
   citations: PolicyCitation[];
+  modelProvider?: string | null;
   evaluatedAt: string;
 }
 

@@ -1,4 +1,5 @@
 import pytest
+from app.core.config import settings
 from app.models.approval import PolicyComplianceStatus
 from app.services.policy_engine import PolicyEngine
 
@@ -352,6 +353,7 @@ def test_hand_labeled_dataset_evaluation():
             amount=item["amount"],
             category=item["category"],
             vendor_name=item["vendor_name"],
+            prefer_offline=True,
         )
         y_true.append(item["expected_status"].value)
         y_pred.append(result.status.value)
@@ -426,8 +428,39 @@ def test_hand_labeled_dataset_evaluation():
         print(f"  - [{m['id']}] {m['title']}: Expected {m['expected']}, Classified as {m['actual']}")
     print(f"=================================================================\n")
 
-    # The evaluation requires high precision (>= 85%) and high recall (>= 85%),
-    # validating performance while honestly publishing the nuanced boundary misses.
     assert passed >= 32, f"Expected at least 32/35 cases to pass, got {passed}/{total}"
     assert precision >= 85.0
     assert recall >= 85.0
+
+
+def test_gemini_policy_agent_resilient_fallback():
+    """Verify that when Gemini API is offline or returns rate-limit (429), PolicyEngine falls back cleanly."""
+    from app.services.policy_engine import GeminiPolicyAgent, PolicyParser
+
+    parser = PolicyParser(settings.POLICY_FILE_PATH)
+    # Instantiate with an invalid or rate-limited key to test fallback
+    agent = GeminiPolicyAgent(parser=parser, api_key="dummy_key_to_test_fallback")
+    
+    # Live call to dummy endpoint will fail and return None
+    result = agent.evaluate(
+        title="Figma License",
+        description="Design tool",
+        amount=180.0,
+        category="SOFTWARE_SAAS",
+        vendor_name="Figma",
+    )
+    assert result is None, "Expected Gemini agent to return None on network/auth error"
+
+    # Orchestrator gracefully falls back to deterministic auditor
+    engine = PolicyEngine()
+    fallback_result = engine.evaluate_request(
+        title="Figma License",
+        description="Design tool license",
+        amount=180.0,
+        category="SOFTWARE_SAAS",
+        vendor_name="Figma",
+    )
+    assert fallback_result is not None
+    assert fallback_result.status in [PolicyComplianceStatus.LIKELY_COMPLIANT, PolicyComplianceStatus.NEEDS_REVIEW]
+    assert len(fallback_result.citations) > 0
+

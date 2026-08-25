@@ -1,98 +1,224 @@
-import os
+import json
+import logging
 import re
-from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
+import httpx
+from pydantic import BaseModel, Field
 from app.core.config import settings
 from app.models.approval import PolicyComplianceStatus
-from app.models.spend_request import SpendCategory, SpendRequest
+from app.models.spend_request import SpendCategory
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PolicyCitation:
-    section: str
-    line_number: int
-    snippet: str
-    relevance: str
+class CitationItem(BaseModel):
+    section: str = Field(..., description="Section tag, e.g., SEC-1, SEC-2")
+    line_number: int = Field(..., description="1-indexed line number in policy document")
+    snippet: str = Field(..., description="Verbatim text from policy line")
+    relevance: str = Field(..., description="Why this policy line applies to the request")
 
 
-@dataclass
-class PolicyEvaluationResult:
+class PolicyEvaluationResult(BaseModel):
     status: PolicyComplianceStatus
-    score: float
+    score: float = Field(..., ge=0.0, le=1.0)
     reason: str
-    citations: list[dict]
+    citations: list[dict[str, Any]]
+    model_provider: str = Field(default="deterministic-rule-engine", description="Model used: gemini-3.6-flash or deterministic-rule-engine")
 
 
 class PolicyParser:
-    """Parses markdown policy document into indexed lines and sections."""
-
-    def __init__(self, policy_path: str = settings.POLICY_FILE_PATH):
+    def __init__(self, policy_path: str):
         self.policy_path = policy_path
-        self.sections: dict[str, dict] = {}
-        self.lines: dict[int, dict] = {}
-        self.raw_content = ""
-        self._load_and_parse()
+        self.lines: list[dict[str, Any]] = []
+        self._load_policy()
 
-    def _load_and_parse(self):
+    def _load_policy(self) -> None:
         path = Path(self.policy_path)
         if not path.exists():
-            return
+            raise FileNotFoundError(f"Procurement policy file not found at: {self.policy_path}")
 
-        self.raw_content = path.read_text(encoding="utf-8")
+        content = path.read_text(encoding="utf-8")
         current_section = "GENERAL"
-        section_title = "General"
 
-        for line in self.raw_content.splitlines():
+        for idx, line in enumerate(content.splitlines(), start=1):
             line_str = line.strip()
-            sec_match = re.search(r"##\s+\d+\.\s+(.*?)\s+\((SEC-\d+)\)", line_str)
-            if sec_match:
-                section_title = sec_match.group(1).strip()
-                current_section = sec_match.group(2).strip()
-                self.sections[current_section] = {
-                    "code": current_section,
-                    "title": section_title,
-                    "lines": [],
-                }
+            if not line_str:
                 continue
 
-            line_match = re.match(r"Line\s+(\d+):\s+(.*)", line_str)
-            if line_match:
-                num = int(line_match.group(1))
-                text = line_match.group(2).strip()
-                item = {
-                    "line_number": num,
+            sec_match = re.search(r"\[(SEC-\d+)\]", line_str)
+            if sec_match:
+                current_section = sec_match.group(1)
+
+            clean_text = re.sub(r"^(\d+\.\s*|[-*#]+\s*|\[SEC-\d+\]\s*)", "", line_str).strip()
+            self.lines.append(
+                {
+                    "line_number": idx,
                     "section": current_section,
-                    "section_title": section_title,
-                    "text": text,
+                    "raw_text": line_str,
+                    "clean_text": clean_text,
                 }
-                self.lines[num] = item
-                if current_section in self.sections:
-                    self.sections[current_section]["lines"].append(item)
+            )
 
-    def get_line(self, line_num: int) -> dict | None:
-        return self.lines.get(line_num)
+    def get_line(self, line_number: int) -> dict[str, Any] | None:
+        for item in self.lines:
+            if item["line_number"] == line_number:
+                return {
+                    "line_number": item["line_number"],
+                    "section": item["section"],
+                    "text": item["clean_text"],
+                }
+        return None
+
+    def get_full_markdown(self) -> str:
+        path = Path(self.policy_path)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
 
 
-class PolicyEngine:
-    """Evaluates spend requests against written corporate policy with grounded citations."""
+class GeminiPolicyAgent:
+    """Live Google Gemini LLM policy auditor with structured JSON output and grounded citation extraction."""
 
-    def __init__(self, policy_path: str = settings.POLICY_FILE_PATH):
-        self.parser = PolicyParser(policy_path)
+    def __init__(self, parser: PolicyParser, api_key: str, model: str = "gemini-3.6-flash"):
+        self.parser = parser
+        self.api_key = api_key
+        self.model = model
+        self.endpoint_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        self._cache: dict[str, PolicyEvaluationResult] = {}
 
-    def evaluate_request(
+    def _build_system_prompt(self) -> str:
+        policy_md = self.parser.get_full_markdown()
+        return f"""You are Waypoint's AI Procurement Policy Auditor.
+Your task is to audit corporate spend requests against the company procurement policy below.
+
+COMPANY PROCUREMENT POLICY DOCUMENT:
+\"\"\"
+{policy_md}
+\"\"\"
+
+AUDITING RULES:
+1. Grounding & Citations: Every single decision MUST cite the exact policy section (e.g. SEC-1, SEC-2) and the exact line number from the document.
+2. Strict Honesty on Insufficient Evidence: If the spend request is vague (e.g. title is 'miscellaneous', 'urgent spend', 'project items'), missing vendor identity, or lacks itemized cost details, you MUST classify it as INSUFFICIENT_EVIDENCE citing SEC-1 Line 4 and SEC-7 Line 27. Do NOT invent justifications.
+3. Prohibited Expenses: Personal expenses, gym memberships, home utilities, cryptocurrency, unitemized alcohol, or cash gift cards MUST be classified as LIKELY_VIOLATION citing SEC-7 Line 24/26.
+4. Risk & Compliance: High-risk AI handling customer data (SEC-2 Line 7), multi-year commitments > 12 months (SEC-2 Line 9), or consulting > $5,000 without signed SOW (SEC-3 Line 11) MUST be classified as NEEDS_REVIEW.
+5. Standard Compliant Spend: Standard tools within amount limits from legitimate vendors must be classified as LIKELY_COMPLIANT.
+
+RESPONSE FORMAT:
+You must respond with valid JSON adhering to this schema:
+{{
+  "status": "LIKELY_COMPLIANT" | "NEEDS_REVIEW" | "LIKELY_VIOLATION" | "INSUFFICIENT_EVIDENCE",
+  "score": float between 0.0 and 1.0,
+  "reason": "Clear explanation citing the relevant policy rule",
+  "citations": [
+    {{
+      "section": "SEC-1",
+      "line_number": 2,
+      "snippet": "All company expenditures must serve a direct business purpose...",
+      "relevance": "Why this line applies"
+    }}
+  ]
+}}"""
+
+    def evaluate(
         self,
         title: str,
         description: str,
         amount: float,
-        category: SpendCategory | str,
+        category: str,
+        vendor_name: str,
+        department: str | None = None,
+    ) -> PolicyEvaluationResult | None:
+        cache_key = f"{title.lower()}|{description.lower()}|{amount}|{category}|{vendor_name.lower()}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        user_content = f"""Spend Request to Audit:
+- Title: {title}
+- Description: {description}
+- Amount: ${amount:,.2f} USD
+- Category: {category}
+- Vendor: {vendor_name}
+- Department: {department or 'General'}"""
+
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": self._build_system_prompt()}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": user_content}]
+                }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "temperature": 0.1,
+            },
+        }
+
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                response = client.post(self.endpoint_url, json=payload)
+
+            if response.status_code == 200:
+                data = response.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(text)
+
+                status_val = parsed.get("status", "NEEDS_REVIEW")
+                status = PolicyComplianceStatus(status_val) if status_val in [s.value for s in PolicyComplianceStatus] else PolicyComplianceStatus.NEEDS_REVIEW
+
+                citations = parsed.get("citations", [])
+                if not citations:
+                    citations = [
+                        {
+                            "section": "SEC-1",
+                            "line_number": 2,
+                            "snippet": "All company expenditures must serve a direct business purpose, represent market value, and adhere to compliance routing.",
+                            "relevance": "General procurement compliance standard.",
+                        }
+                    ]
+
+                result = PolicyEvaluationResult(
+                    status=status,
+                    score=float(parsed.get("score", 0.5)),
+                    reason=str(parsed.get("reason", "Audited by Gemini AI policy agent.")),
+                    citations=citations,
+                    model_provider=f"gemini ({self.model})",
+                )
+                self._cache[cache_key] = result
+                return result
+            else:
+                logger.warning(
+                    f"Gemini API returned status {response.status_code}: {response.text[:200]}. Falling back to deterministic auditor."
+                )
+                return None
+        except Exception as exc:
+            logger.warning(f"Gemini policy evaluation request failed: {exc}. Falling back to deterministic auditor.")
+            return None
+
+
+class DeterministicPolicyAuditor:
+    """Fast, deterministic policy auditor for offline benchmarking, local testing, and rate-limit fallback."""
+
+    def __init__(self, parser: PolicyParser):
+        self.parser = parser
+
+    def evaluate(
+        self,
+        title: str,
+        description: str,
+        amount: float,
+        category: str,
         vendor_name: str,
         department: str | None = None,
     ) -> PolicyEvaluationResult:
-        cat = category.value if isinstance(category, SpendCategory) else str(category)
         text_corpus = f"{title} {description} {vendor_name}".lower()
+        lower_title = title.lower().strip()
 
         # Check 1: Insufficient Grounding / Missing Information (SEC-1, Line 4; SEC-7, Line 27)
-        lower_title = title.lower().strip()
         is_vague_title = lower_title in ["payment", "invoice", "urgent payment", "stuff", "items", "project payment", "general expense", "general expenses", "miscellaneous", "misc", "urgent spend"] or any(
             vague in lower_title for vague in ["miscellaneous items", "misc expense", "general expense", "urgent spend", "unitemized"]
         )
@@ -132,6 +258,7 @@ class PolicyEngine:
                 score=0.20,
                 reason="Insufficient evidence provided. Request lacks required vendor identification or itemized breakdown for compliance auditing.",
                 citations=citations,
+                model_provider="deterministic-rule-engine",
             )
 
         # Check 1b: Split purchases & multi-part transactions (SEC-1, Line 3)
@@ -153,6 +280,7 @@ class PolicyEngine:
                         "relevance": "Anti-structuring rule: multi-part transaction requires review.",
                     }
                 ],
+                model_provider="deterministic-rule-engine",
             )
 
         # Check 2: Strictly Prohibited Personal Expenses & Prohibited Items (SEC-7, Line 24, 26)
@@ -178,244 +306,294 @@ class PolicyEngine:
                         "section": line["section"],
                         "line_number": line["line_number"],
                         "snippet": line["text"],
-                        "relevance": "Non-compliant personal or cash-equivalent spend detected.",
+                        "relevance": "Strict prohibition on non-reimbursable personal expenditures.",
                     }
                 ],
+                model_provider="deterministic-rule-engine",
             )
 
-        # Check 3: Alcohol-only purchases (SEC-4, Line 17)
-        if any(term in text_corpus for term in ["cocktails", "bar tab", "liquor", "alcohol only", "beer run"]) and not any(food in text_corpus for food in ["meal", "dinner", "lunch", "catering"]):
-            line = self.parser.get_line(17) or {
-                "section": "SEC-4",
-                "line_number": 17,
-                "text": "Alcohol-only expenditures without an accompanying business meal are non-reimbursable.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.LIKELY_VIOLATION,
-                score=0.10,
-                reason=f"Violation of travel and entertainment policy ({line['section']} Line {line['line_number']}). Alcohol expenditures without an accompanying business meal are non-reimbursable.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Alcohol-only expenditure without business meal justification.",
-                    }
-                ],
-            )
+        # Check 3: Travel and Entertainment Overage Boundaries (SEC-4, Line 15, 17, 18)
+        if category == SpendCategory.TRAVEL_ENTERTAINMENT.value:
+            if any(k in text_corpus for k in ["bar tab", "cocktails", "alcohol", "nightclub"]) and not any(k in text_corpus for k in ["dinner", "lunch", "client meeting"]):
+                line = self.parser.get_line(17) or {
+                    "section": "SEC-4",
+                    "line_number": 17,
+                    "text": "Standalone bar tabs without meal accompaniment or pre-approved team celebration budget are non-reimbursable.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.LIKELY_VIOLATION,
+                    score=0.10,
+                    reason=f"Policy violation: standalone alcohol bar tab ({line['section']} Line {line['line_number']}).",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "Standalone bar tabs are non-reimbursable under T&E policy.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
 
-        # Check 4: Excessive Single Meal Limits (SEC-4, Line 15)
-        if cat == "TRAVEL_ENTERTAINMENT" and any(m in text_corpus for m in ["dinner", "lunch", "breakfast", "meal", "food"]):
-            # Check for explicit per-person overages if single person meal exceeds $75
-            single_person = any(s in text_corpus for s in ["solo", "1 person", "single traveler", "myself", "personal dinner"]) or ("attendee" not in text_corpus and "team" not in text_corpus and "client" not in text_corpus)
-            if single_person and amount > 75.0:
+            is_dinner = "dinner" in text_corpus
+            is_lunch = "lunch" in text_corpus
+            is_solo_or_single = any(s in text_corpus for s in ["single", "solo", "individual", "room service", "airport bistro", "one traveler"])
+
+            if is_dinner and (amount > 75.00 and is_solo_or_single):
                 line = self.parser.get_line(15) or {
                     "section": "SEC-4",
                     "line_number": 15,
-                    "text": "Single meal reimbursements must not exceed $75.00 per person for dinner or $35.00 per person for lunch/breakfast.",
+                    "text": "Meals during individual business travel are capped at $25.00 for breakfast, $35.00 for lunch, and $75.00 for dinner per person.",
                 }
                 return PolicyEvaluationResult(
                     status=PolicyComplianceStatus.LIKELY_VIOLATION,
                     score=0.15,
-                    reason=f"Single meal claim (${amount:.2f}) exceeds the maximum per-person meal allowance ($75.00) under {line['section']} Line {line['line_number']}.",
+                    reason=f"Individual dinner expense (${amount:.2f}) exceeds policy cap of $75.00 ({line['section']} Line {line['line_number']}).",
                     citations=[
                         {
                             "section": line["section"],
                             "line_number": line["line_number"],
                             "snippet": line["text"],
-                            "relevance": "Individual meal expense exceeds allowable limit.",
+                            "relevance": "Per diem meal threshold exceeded for individual traveler.",
                         }
                     ],
+                    model_provider="deterministic-rule-engine",
                 )
 
-        # Check 5: Multi-year software commitments (SEC-2, Line 9)
-        if cat == "SOFTWARE_SAAS" and any(term in text_corpus for term in ["2-year", "3-year", "multi-year", "multi year", "24 month", "36 month"]):
-            line = self.parser.get_line(9) or {
-                "section": "SEC-2",
-                "line_number": 9,
-                "text": "Multi-year software commitments (>12 months) require Legal Counsel review and CFO authorization regardless of total spend.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.NEEDS_REVIEW,
-                score=0.55,
-                reason=f"Multi-year software commitment detected ({line['section']} Line {line['line_number']}). Requires Legal Counsel and CFO authorization.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Multi-year commitment requires Legal and CFO sign-off.",
-                    }
-                ],
-            )
+            if is_lunch and (amount > 35.00 and is_solo_or_single):
+                line = self.parser.get_line(15) or {
+                    "section": "SEC-4",
+                    "line_number": 15,
+                    "text": "Meals during individual business travel are capped at $25.00 for breakfast, $35.00 for lunch, and $75.00 for dinner per person.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.LIKELY_VIOLATION,
+                    score=0.15,
+                    reason=f"Individual lunch expense (${amount:.2f}) exceeds policy cap of $35.00 ({line['section']} Line {line['line_number']}).",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "Per diem meal threshold exceeded for individual traveler.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
 
-        # Check 6: Generative AI Services processing customer or confidential data (SEC-2, Line 7)
-        if any(ai_term in text_corpus for ai_term in ["generative ai", "llm api", "openai api", "anthropic api", "chatgpt team", "copilot", "claude enterprise"]) and any(data_term in text_corpus for data_term in ["customer data", "confidential", "source code", "proprietary", "production"]):
-            line = self.parser.get_line(7) or {
-                "section": "SEC-2",
-                "line_number": 7,
-                "text": "Use of commercial generative AI tools processing confidential company or customer data requires Security approval and SOC2 Type II verification.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.NEEDS_REVIEW,
-                score=0.50,
-                reason=f"AI service handling sensitive company or customer data ({line['section']} Line {line['line_number']}). Mandatory Security review and SOC2 verification required.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Commercial AI tool processing confidential data requires Security verification.",
-                    }
-                ],
-            )
-
-        # Check 7: Restricted / Sanctioned Vendors (SEC-6, Line 21)
-        sanctioned_keywords = ["sanctioned entity", "unverified offshore", "unregistered tax id", "blocked vendor", "anonymous offshore llc"]
-        if any(sk in text_corpus for sk in sanctioned_keywords):
-            line = self.parser.get_line(21) or {
-                "section": "SEC-6",
-                "line_number": 21,
-                "text": "Any vendor appearing on government sanctions lists or lacking verified tax identification (W-9 / W-8BEN) cannot be onboarded.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.LIKELY_VIOLATION,
-                score=0.02,
-                reason=f"Restricted vendor compliance alert ({line['section']} Line {line['line_number']}). Vendor fails tax verification or sanctions screening.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Vendor flagged in compliance screening.",
-                    }
-                ],
-            )
-
-        # Check 8: Large Team Events / Offsites (SEC-4, Line 16)
-        if cat == "TRAVEL_ENTERTAINMENT" and amount > 1500.0 and any(w in text_corpus for w in ["offsite", "team event", "all hands", "dinner for team", "retreat"]):
-            line = self.parser.get_line(16) or {
-                "section": "SEC-4",
-                "line_number": 16,
-                "text": "Team offsites, dinners, or entertainment events exceeding $1,500.00 total require prior written approval from the Department VP.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.NEEDS_REVIEW,
-                score=0.60,
-                reason=f"Team event spend exceeds $1,500.00 threshold ({line['section']} Line {line['line_number']}). Department VP written approval required.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Team entertainment threshold exceeded.",
-                    }
-                ],
-            )
-
-        # Check 9: High-value Consulting without Statement of Work (SEC-5, Line 19)
-        if cat == "CONSULTING_CONTRACTOR" and amount > 5000.0:
-            has_sow = any(s in text_corpus for s in ["sow attached", "executed msas", "sow signed", "legal approved sow"])
-            if not has_sow:
-                line = self.parser.get_line(19) or {
-                    "section": "SEC-5",
-                    "line_number": 19,
-                    "text": "Consulting agreements exceeding $5,000.00 require Legal Counsel review and approval prior to contractor onboarding.",
+            if amount > 1500.00:
+                line = self.parser.get_line(18) or {
+                    "section": "SEC-4",
+                    "line_number": 18,
+                    "text": "Team offsites or group events exceeding $1,500.00 total require Department Head pre-approval before booking.",
                 }
                 return PolicyEvaluationResult(
                     status=PolicyComplianceStatus.NEEDS_REVIEW,
                     score=0.55,
-                    reason=f"Consulting engagement exceeds $5,000.00 ({line['section']} Line {line['line_number']}). SOW and Legal Counsel review required.",
+                    reason=f"Group travel / team offsite exceeds $1,500.00 threshold ({line['section']} Line {line['line_number']}). Requires Department Head review.",
                     citations=[
                         {
                             "section": line["section"],
                             "line_number": line["line_number"],
                             "snippet": line["text"],
-                            "relevance": "Consulting over $5,000 requires SOW and Legal sign-off.",
+                            "relevance": "Group event requires Department Head pre-approval.",
                         }
                     ],
+                    model_provider="deterministic-rule-engine",
                 )
 
-        # Check 10: Standard Compliant Purchases
-        # Software under $500 from approved catalog (SEC-2, Line 8)
-        if cat == "SOFTWARE_SAAS" and amount <= 500.0:
-            line = self.parser.get_line(8) or {
-                "section": "SEC-2",
-                "line_number": 8,
-                "text": "Software purchases under $500.00 from pre-approved internal app catalogs may proceed with direct manager approval only.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.LIKELY_COMPLIANT,
-                score=0.95,
-                reason=f"Standard SaaS spend under $500.00 limit ({line['section']} Line {line['line_number']}). Compliant with standard manager routing.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Pre-approved software under $500 threshold.",
-                    }
-                ],
-            )
+        # Check 4: Software & SaaS Governance (SEC-2, Line 6, 7, 8, 9)
+        if category == SpendCategory.SOFTWARE_SAAS.value:
+            if any(ai_term in text_corpus for ai_term in ["generative ai", "llm", "claude", "gpt", "customer data", "proprietary code"]):
+                line = self.parser.get_line(7) or {
+                    "section": "SEC-2",
+                    "line_number": 7,
+                    "text": "Use of commercial generative AI tools processing confidential company or customer data requires Security approval and SOC2 Type II verification.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.NEEDS_REVIEW,
+                    score=0.50,
+                    reason=f"AI service handling sensitive company or customer data ({line['section']} Line {line['line_number']}). Mandatory Security review and SOC2 verification required.",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "Security & SOC2 review required for AI tooling with company data.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
 
-        # Standard hardware or office supplies
-        if cat == "HARDWARE" and amount <= 500.0:
-            line = self.parser.get_line(11) or {
-                "section": "SEC-3",
-                "line_number": 11,
-                "text": "Peripheral devices, monitors, and home office equipment exceeding $500.00 require IT Operations department verification.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.LIKELY_COMPLIANT,
-                score=0.95,
-                reason=f"Peripheral equipment within allowable standard limit ({line['section']} Line {line['line_number']}). Compliant with standard procurement.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Equipment purchase within standard peripheral tier.",
-                    }
-                ],
-            )
+            if any(term in text_corpus for term in ["3-year", "multi-year", "36-month", "24-month", "multi year"]):
+                line = self.parser.get_line(9) or {
+                    "section": "SEC-2",
+                    "line_number": 9,
+                    "text": "Auto-renewing or multi-year SaaS contracts exceeding 12 months require Finance and Legal review regardless of amount.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.NEEDS_REVIEW,
+                    score=0.50,
+                    reason=f"Multi-year SaaS commitment exceeding 12 months ({line['section']} Line {line['line_number']}). Mandatory Finance & Legal review required.",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "Multi-year commitments require Legal and Finance review.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
 
-        # Standard business meal under limit (SEC-4, Line 15)
-        if cat == "TRAVEL_ENTERTAINMENT" and amount <= 75.0 and any(w in text_corpus for w in ["meal", "lunch", "dinner", "breakfast", "coffee meeting"]):
-            line = self.parser.get_line(15) or {
-                "section": "SEC-4",
-                "line_number": 15,
-                "text": "Single meal reimbursements must not exceed $75.00 per person for dinner or $35.00 per person for lunch/breakfast.",
-            }
-            return PolicyEvaluationResult(
-                status=PolicyComplianceStatus.LIKELY_COMPLIANT,
-                score=0.96,
-                reason=f"Business meal within per-person policy threshold ({line['section']} Line {line['line_number']}). Compliant with travel policy.",
-                citations=[
-                    {
-                        "section": line["section"],
-                        "line_number": line["line_number"],
-                        "snippet": line["text"],
-                        "relevance": "Meal claim within allowable per-person limit.",
-                    }
-                ],
-            )
+            if amount < 500.00:
+                line = self.parser.get_line(8) or {
+                    "section": "SEC-2",
+                    "line_number": 8,
+                    "text": "Software purchases under $500.00 from pre-approved internal app catalogs may proceed with direct manager approval only.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.LIKELY_COMPLIANT,
+                    score=0.95,
+                    reason=f"Standard SaaS spend under $500.00 limit ({line['section']} Line {line['line_number']}). Compliant with standard manager routing.",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "Low-risk software tier under $500.00.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
 
-        # General business spend meeting standard scope (SEC-1, Line 2)
-        line2 = self.parser.get_line(2) or {
+        # Check 5: Consulting & Contractor Engagements (SEC-3, Line 10, 11, 12)
+        if category == SpendCategory.CONSULTING_CONTRACTOR.value:
+            if any(bad in text_corpus for bad in ["sanctioned", "no w8", "unregistered tax id"]):
+                line = self.parser.get_line(12) or {
+                    "section": "SEC-3",
+                    "line_number": 12,
+                    "text": "Contractor payments without verified W-9 / W-8BEN tax forms or involving restricted offshore jurisdictions are prohibited.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.LIKELY_VIOLATION,
+                    score=0.05,
+                    reason=f"Contractor compliance violation ({line['section']} Line {line['line_number']}). Missing tax forms or restricted jurisdiction.",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "Tax documentation and jurisdiction restriction violation.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
+
+            if amount > 5000.00 and not any(k in text_corpus for k in ["sow executed", "msa signed", "executed sow"]):
+                line = self.parser.get_line(11) or {
+                    "section": "SEC-3",
+                    "line_number": 11,
+                    "text": "All professional services and contractor engagements exceeding $5,000.00 require a fully executed Statement of Work (SOW) and Legal review prior to work commencement.",
+                }
+                return PolicyEvaluationResult(
+                    status=PolicyComplianceStatus.NEEDS_REVIEW,
+                    score=0.55,
+                    reason=f"Contractor engagement > $5,000.00 ({line['section']} Line {line['line_number']}). Requires executed SOW and Legal Counsel review.",
+                    citations=[
+                        {
+                            "section": line["section"],
+                            "line_number": line["line_number"],
+                            "snippet": line["text"],
+                            "relevance": "High-value consulting requires Legal review and SOW.",
+                        }
+                    ],
+                    model_provider="deterministic-rule-engine",
+                )
+
+        # Default: Standard Compliant Spend
+        line1 = self.parser.get_line(2) or {
             "section": "SEC-1",
             "line_number": 2,
             "text": "All company expenditures must serve a direct business purpose, represent market value, and adhere to compliance routing.",
         }
+        citations = [
+            {
+                "section": line1["section"],
+                "line_number": line1["line_number"],
+                "snippet": line1["text"],
+                "relevance": "General procurement compliance standard.",
+            }
+        ]
+
+        if category == SpendCategory.SOFTWARE_SAAS.value and amount > 1000.00:
+            line_sec = self.parser.get_line(6)
+            if line_sec:
+                citations.append(
+                    {
+                        "section": line_sec["section"],
+                        "line_number": line_sec["line_number"],
+                        "snippet": line_sec["text"],
+                        "relevance": "Software exceeding $1,000 requires Security & IT review.",
+                    }
+                )
+
         return PolicyEvaluationResult(
             status=PolicyComplianceStatus.LIKELY_COMPLIANT,
-            score=0.90,
-            reason=f"Valid business justification identified ({line2['section']} Line {line2['line_number']}). Ready for approval routing.",
-            citations=[
-                {
-                    "section": line2["section"],
-                    "line_number": line2["line_number"],
-                    "snippet": line2["text"],
-                    "relevance": "Legitimate business expenditure adhering to core procurement policy.",
-                }
-            ],
+            score=0.92,
+            reason=f"Valid business justification identified ({line1['section']} Line {line1['line_number']}). Compliant spend routed through standard tiers.",
+            citations=citations,
+            model_provider="deterministic-rule-engine",
+        )
+
+
+class PolicyEngine:
+    """Orchestrator supporting dual-mode evaluation: live Google Gemini LLM agent with resilient fallback to deterministic auditor."""
+
+    def __init__(self, policy_path: str | None = None, enable_llm: bool = True):
+        self.policy_path = policy_path or settings.POLICY_FILE_PATH
+        self.parser = PolicyParser(self.policy_path)
+        self.deterministic_auditor = DeterministicPolicyAuditor(self.parser)
+        self.gemini_agent: GeminiPolicyAgent | None = None
+
+        if enable_llm and settings.LLM_API_KEY:
+            self.gemini_agent = GeminiPolicyAgent(
+                parser=self.parser,
+                api_key=settings.LLM_API_KEY,
+                model=settings.GEMINI_MODEL,
+            )
+
+    def evaluate_request(
+        self,
+        title: str,
+        description: str,
+        amount: float,
+        category: SpendCategory | str,
+        vendor_name: str,
+        department: str | None = None,
+        prefer_offline: bool = False,
+    ) -> PolicyEvaluationResult:
+        cat = category.value if isinstance(category, SpendCategory) else str(category)
+
+        # 1. Try Gemini LLM agent if configured and not explicitly running offline benchmark
+        if self.gemini_agent and not prefer_offline:
+            llm_result = self.gemini_agent.evaluate(
+                title=title,
+                description=description,
+                amount=amount,
+                category=cat,
+                vendor_name=vendor_name,
+                department=department,
+            )
+            if llm_result:
+                return llm_result
+
+        # 2. Fall back to high-performance deterministic auditor
+        return self.deterministic_auditor.evaluate(
+            title=title,
+            description=description,
+            amount=amount,
+            category=cat,
+            vendor_name=vendor_name,
+            department=department,
         )

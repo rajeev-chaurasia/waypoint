@@ -100,6 +100,7 @@ class PolicyEvaluation(Base):
     score: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     citations: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
+    model_provider: Mapped[str | None] = mapped_column(String(64), default="deterministic-rule-engine", nullable=True)
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )

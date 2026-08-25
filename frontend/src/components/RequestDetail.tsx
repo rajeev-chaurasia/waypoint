@@ -224,9 +224,14 @@ export const RequestDetail: React.FC<Props> = ({
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                 <ShieldCheck size={18} color="#60a5fa" />
                 <h4 style={{ fontSize: '0.9375rem', fontWeight: 700 }}>AI Policy Grounding Assessment</h4>
+                {request.policyEvaluation.modelProvider && (
+                  <span style={{ fontSize: '0.6875rem', padding: '2px 8px', borderRadius: '4px', background: 'rgba(96, 165, 250, 0.15)', color: '#93c5fd', border: '1px solid rgba(96, 165, 250, 0.3)', fontWeight: 600 }}>
+                    {request.policyEvaluation.modelProvider}
+                  </span>
+                )}
               </div>
               <AIComplianceBadge status={request.policyEvaluation.status} score={request.policyEvaluation.score} showScore />
             </div>

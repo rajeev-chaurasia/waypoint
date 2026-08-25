@@ -96,6 +96,7 @@ class RequestService:
             score=eval_result.score,
             reason=eval_result.reason,
             citations=eval_result.citations,
+            model_provider=eval_result.model_provider,
             evaluated_at=datetime.now(timezone.utc),
         )
         session.add(new_eval)

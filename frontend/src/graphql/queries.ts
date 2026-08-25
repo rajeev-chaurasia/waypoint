@@ -25,6 +25,7 @@ export const GET_SPEND_REQUESTS = gql`
         status
         score
         reason
+        modelProvider
         citations {
           section
           lineNumber
@@ -79,6 +80,7 @@ export const GET_SPEND_REQUEST = gql`
         status
         score
         reason
+        modelProvider
         citations {
           section
           lineNumber
