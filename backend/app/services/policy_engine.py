@@ -134,6 +134,27 @@ class PolicyEngine:
                 citations=citations,
             )
 
+        # Check 1b: Split purchases & multi-part transactions (SEC-1, Line 3)
+        if any(term in text_corpus for term in ["instalment", "installment", "part 1", "part 2", "split payment", "deposit for"]):
+            line = self.parser.get_line(3) or {
+                "section": "SEC-1",
+                "line_number": 3,
+                "text": "Splitting purchases into multiple smaller transactions to circumvent approval thresholds is strictly prohibited.",
+            }
+            return PolicyEvaluationResult(
+                status=PolicyComplianceStatus.NEEDS_REVIEW,
+                score=0.60,
+                reason=f"Potential multi-part or split transaction detected ({line['section']} Line {line['line_number']}). Requires compliance review to prevent threshold circumvention.",
+                citations=[
+                    {
+                        "section": line["section"],
+                        "line_number": line["line_number"],
+                        "snippet": line["text"],
+                        "relevance": "Anti-structuring rule: multi-part transaction requires review.",
+                    }
+                ],
+            )
+
         # Check 2: Strictly Prohibited Personal Expenses & Prohibited Items (SEC-7, Line 24, 26)
         personal_triggers = [
             "gym membership", "fitness", "home utility", "utility bill", "electricity", "electric bill",

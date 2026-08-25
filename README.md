@@ -10,7 +10,7 @@ AI-assisted spend and procurement approval router inspired by modern workflow or
 
 * Built a GraphQL API in FastAPI and Strawberry for a spend-approval router, fixing an N+1 query with DataLoader batching that cut per-request query count from **81** to **5** SQL queries (93.8% reduction).
 * Implemented rule-based approval routing across amount and category tiers, verified by **26/26** table-driven boundary tests including exact-threshold edge cases ($499.99 vs $500.00, $9,999.99 vs $10,000.00, $49,999.99 vs $50,000.00).
-* Built a policy-grounded AI agent that classifies each request against a written policy doc with line-level citations, measured at **100.0%** precision and **100.0%** recall over a **30**-case hand-labeled set.
+* Built a policy-grounded AI agent that classifies each request against a written policy doc with line-level citations, measured at **97.1%** accuracy (**100.0%** precision and **100.0%** recall) over a **35**-case hand-labeled set with documented boundary failure modes.
 * Shipped a React and TypeScript frontend over Apollo Client, submitting and reviewing requests live with role-based approver actions and policy grounding inspection.
 
 ---
@@ -56,14 +56,14 @@ Table-driven test suite validating exact dollar boundaries and category-specific
 *Test command*: `pytest backend/tests/test_approval_routing.py -v -s`
 
 ### 3. AI Policy Agent Evaluation
-
 Hand-labeled dataset evaluating classification accuracy and grounded citation generation against `corporate_procurement_policy_v1.md`:
 
-* **Total Hand-Labeled Cases**: 30 (10 Compliant, 10 Violation, 10 Ambiguous/Review)
-* **Exact Matches**: 30 / 30 (100.0%)
+* **Total Hand-Labeled Cases**: 35 (10 Compliant, 10 Violation, 10 Ambiguous/Review, 5 Boundary Cases)
+* **Exact Status Matches**: 34 / 35 (**97.1% accuracy**)
 * **Compliant Precision**: 100.0%
 * **Compliant Recall**: 100.0%
 * **Citation Grounding Rate**: 100.0% (every decision cites explicit policy section and line number)
+* **Documented Failure Mode**: Case E-02 ($160 dinner with unstated headcount) was conservatively classified as `LIKELY_VIOLATION` rather than `NEEDS_REVIEW`, deliberately favoring false alarms over false compliance approvals.
 * **Hallucination on Vague Data**: 0.0% (unitemized or missing vendor requests flagged as `INSUFFICIENT_EVIDENCE`)
 
 *Test command*: `pytest backend/tests/test_policy_agent.py -v -s`

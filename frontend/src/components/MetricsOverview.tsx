@@ -176,7 +176,7 @@ export const MetricsOverview: React.FC = () => {
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-input)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8125rem' }}>
               <span style={{ color: 'var(--text-secondary)' }}>Hand-Labeled Cases:</span>
-              <strong style={{ color: '#34d399' }}>30 / 30 Exact Match</strong>
+              <strong style={{ color: '#34d399' }}>34 / 35 (97.1% Accuracy)</strong>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8125rem' }}>
               <span style={{ color: 'var(--text-secondary)' }}>Compliant Precision:</span>
@@ -191,8 +191,8 @@ export const MetricsOverview: React.FC = () => {
               <strong style={{ color: '#a78bfa' }}>100.0%</strong>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8125rem' }}>
-              <span style={{ color: 'var(--text-secondary)' }}>Honesty on Vague Inputs:</span>
-              <span style={{ color: '#34d399', fontWeight: 600 }}>Zero Hallucinations</span>
+              <span style={{ color: 'var(--text-secondary)' }}>Boundary Edge Cases:</span>
+              <span style={{ color: '#34d399', fontWeight: 600 }}>1 Documented Miss (E-02)</span>
             </div>
           </div>
         </div>

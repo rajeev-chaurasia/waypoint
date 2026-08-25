@@ -48,10 +48,14 @@ uv run pytest backend/tests/test_policy_agent.py -v -s
 **Measured Execution Output:**
 ```
 ================ POLICY AGENT EVALUATION REPORT ================
-Total Hand-Labeled Test Cases: 30
-Exact Matches: 30/30 (100.0%)
-Compliant Precision: 100.0%
-Compliant Recall: 100.0%
+Total Hand-Labeled Test Cases:   35
+Exact Status Matches:            34/35 (97.1%)
+Compliant Precision:             100.0%
+Compliant Recall:                100.0%
+Compliant F1 Score:              100.0%
+Citation Grounding Rate:         100.0% (all decisions cited)
+Failure / Boundary Edge Cases:   1 documented misses
+  - [E-02] Dinner with prospect in Boston: Expected NEEDS_REVIEW, Classified as LIKELY_VIOLATION
 =================================================================
 ```
 
