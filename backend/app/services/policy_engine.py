@@ -159,7 +159,7 @@ You must respond with valid JSON adhering to this schema:
         }
 
         try:
-            with httpx.Client(timeout=8.0) as client:
+            with httpx.Client(timeout=25.0) as client:
                 response = client.post(self.endpoint_url, json=payload)
 
             if response.status_code == 200:
