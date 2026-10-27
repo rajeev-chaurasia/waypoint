@@ -4,17 +4,6 @@ AI-assisted spend and procurement approval router inspired by modern workflow or
 
 ---
 
-## Resume Summary
-
-**waypoint | AI-Assisted Procurement Approval Router | Python, FastAPI, GraphQL, React, TypeScript, PostgreSQL**
-
-* Built a GraphQL API in FastAPI and Strawberry for a spend-approval router, fixing an N+1 query with DataLoader batching that cut per-request query count from **81** to **5** SQL queries (93.8% reduction).
-* Implemented rule-based approval routing across amount and category tiers, verified by **26/26** table-driven boundary tests including exact-threshold edge cases ($499.99 vs $500.00, $9,999.99 vs $10,000.00, $49,999.99 vs $50,000.00).
-* Built a dual-mode policy-grounded AI agent using Google Gemini (`gemini-3.6-flash`) with sub-millisecond local fallback, achieving **100.0%** precision and line-level citations over a **35**-case benchmark set with documented boundary failure modes.
-* Shipped a React and TypeScript frontend over Apollo Client, submitting and reviewing requests live with role-based approver actions and policy grounding inspection.
-
----
-
 ## Core System Capabilities
 
 1. **Deterministic Multi-Tier Routing Engine**: Evaluates spend requests across amount thresholds and category criteria (Software SaaS, IT Hardware, Consulting, Travel, Marketing). Injects domain reviews (Security, Legal, Finance, Executive, Board) deterministically.
